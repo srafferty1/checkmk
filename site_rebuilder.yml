@@ -1,0 +1,383 @@
+---
+###############################################################################
+# CheckMK Site Rebuild Playbook
+# Purpose : Migrate config from RAF02B into an existing RAF01A site, replacing
+#           all RAF01B host prefix references with RAF01A throughout, then
+#           verify the result against a cmcdump taken from the original RAF01A.
+#
+# Pre-requisites:
+#   - RAF02B backup tar.gz placed in /tmp on the Ansible controller
+#   - cmcdump -C file already present on RAF01A (path set via cmcdump_path var)
+#   - RAF01A site already exists with LDAP configured
+#   - CheckMK CEE same version on both servers
+#
+# Usage:
+#   ansible-playbook checkmk_rebuild.yml
+#
+# Run specific stages with tags:
+#   ansible-playbook checkmk_rebuild.yml --tags preflight
+#   ansible-playbook checkmk_rebuild.yml --tags extract,copy
+#   ansible-playbook checkmk_rebuild.yml --tags replace,verify
+#   ansible-playbook checkmk_rebuild.yml --tags activate
+#   ansible-playbook checkmk_rebuild.yml --tags validate
+###############################################################################
+
+- name: "CheckMK CEE Site Rebuild — RAF02B config → RAF01A site"
+  hosts: "{{ dest_host }}"
+  become: true
+  gather_facts: true
+
+  vars:
+    # ── Hosts ────────────────────────────────────────────────────────────────
+    dest_host:            "RAF01A"           # Ansible inventory name for target
+
+    # ── Site names ───────────────────────────────────────────────────────────
+    source_site:          "CHANGE_ME_SOURCE_SITE"   # omd site name on RAF02B
+    dest_site:            "CHANGE_ME_DEST_SITE"     # omd site name on RAF01A
+
+    # ── Hostname prefix replacement ───────────────────────────────────────────
+    # All occurrences of old_prefix will be replaced with new_prefix.
+    # sed is case-insensitive so RAF01B / raf01b / Raf01B are all covered.
+    old_prefix:           "RAF01B"
+    new_prefix:           "RAF01A"
+
+    # ── Backup file (tar.gz from RAF02B, placed in /tmp on controller) ───────
+    backup_filename:      "checkmk_RAF02B_backup.tar.gz"
+    backup_src:           "/tmp/{{ backup_filename }}"       # controller path
+    backup_dest:          "/tmp/{{ backup_filename }}"       # dest host path
+
+    # ── Staging directory on dest host ───────────────────────────────────────
+    # Backup is extracted here for inspection before being copied into the site
+    staging_dir:          "/tmp/checkmk_rebuild_staging"
+
+    # ── cmcdump file (already on RAF01A) ────────────────────────────────────
+    cmcdump_path:         "CHANGE_ME_PATH_TO_CMCDUMP"  # e.g. /root/cmcdump.txt
+
+    # ── LDAP config file to preserve (do not overwrite) ─────────────────────
+    ldap_config_file:     "etc/check_mk/multisite.d/wato/ldap_connections.mk"
+
+    # ── Config paths to copy from backup into site ───────────────────────────
+    # ldap_config_file is explicitly excluded during copy
+    config_dirs:
+      - "etc/check_mk/conf.d/wato"
+      - "etc/check_mk/multisite.d/wato"
+      - "var/check_mk/autochecks"
+
+    config_files:
+      - "etc/check_mk/main.mk"
+      - "etc/check_mk/multisite.mk"
+
+    # ── Paths to scan for prefix replacement ────────────────────────────────
+    replace_paths:
+      - "etc/check_mk/conf.d/wato"
+      - "etc/check_mk/multisite.d/wato"
+      - "var/check_mk/autochecks"
+      - "etc/check_mk/main.mk"
+      - "etc/check_mk/multisite.mk"
+
+  ###############################################################################
+  # PRE-FLIGHT
+  ###############################################################################
+  pre_tasks:
+
+    - name: "Preflight | Verify backup tar.gz exists on controller"
+      delegate_to: localhost
+      become: false
+      ansible.builtin.stat:
+        path: "{{ backup_src }}"
+      register: backup_stat
+      failed_when: not backup_stat.stat.exists
+      tags: [preflight]
+
+    - name: "Preflight | Verify cmcdump file exists on {{ dest_host }}"
+      ansible.builtin.stat:
+        path: "{{ cmcdump_path }}"
+      register: cmcdump_stat
+      failed_when: not cmcdump_stat.stat.exists
+      tags: [preflight]
+
+    - name: "Preflight | Verify dest site exists"
+      ansible.builtin.command: "omd status {{ dest_site }}"
+      register: dest_site_check
+      failed_when: dest_site_check.rc == 2    # rc 2 = site does not exist
+      changed_when: false
+      tags: [preflight]
+
+    - name: "Preflight | Verify LDAP config exists and will be preserved"
+      ansible.builtin.stat:
+        path: "/opt/omd/sites/{{ dest_site }}/{{ ldap_config_file }}"
+      register: ldap_stat
+      tags: [preflight]
+
+    - name: "Preflight | Report LDAP config status"
+      ansible.builtin.debug:
+        msg: >
+          {% if ldap_stat.stat.exists %}
+          OK: LDAP config found at {{ ldap_config_file }} — will be preserved.
+          {% else %}
+          WARNING: LDAP config not found at expected path. Verify path is correct
+          before continuing, or it may be overwritten by the copy step.
+          {% endif %}
+      tags: [preflight]
+
+    - name: "Preflight | Backup existing LDAP config to /tmp"
+      ansible.builtin.copy:
+        src:    "/opt/omd/sites/{{ dest_site }}/{{ ldap_config_file }}"
+        dest:   "/tmp/ldap_connections.mk.bak"
+        remote_src: true
+        mode:   "0600"
+      when: ldap_stat.stat.exists
+      tags: [preflight]
+
+    - name: "Preflight | Create staging directory"
+      ansible.builtin.file:
+        path:  "{{ staging_dir }}"
+        state: directory
+        mode:  "0700"
+      tags: [preflight]
+
+  ###############################################################################
+  # TASKS
+  ###############################################################################
+  tasks:
+
+    # ── 1. Transfer and extract backup ────────────────────────────────────────
+    - name: "Extract | Copy backup archive to {{ dest_host }}"
+      ansible.builtin.copy:
+        src:  "{{ backup_src }}"
+        dest: "{{ backup_dest }}"
+        mode: "0600"
+      tags: [extract]
+
+    - name: "Extract | Extract backup archive into staging directory"
+      ansible.builtin.unarchive:
+        src:        "{{ backup_dest }}"
+        dest:       "{{ staging_dir }}"
+        remote_src: true
+      tags: [extract]
+
+    - name: "Extract | List extracted staging contents"
+      ansible.builtin.command: "find {{ staging_dir }} -maxdepth 4 -type d"
+      register: staging_contents
+      changed_when: false
+      tags: [extract]
+
+    - name: "Extract | Show staging contents"
+      ansible.builtin.debug:
+        var: staging_contents.stdout_lines
+      tags: [extract]
+
+    # ── 2. Stop dest site before config surgery ───────────────────────────────
+    - name: "Site | Stop {{ dest_site }} before config copy"
+      ansible.builtin.command: "omd stop {{ dest_site }}"
+      changed_when: true
+      tags: [copy]
+
+    # ── 3. Copy config dirs from staging into site (exclude LDAP) ─────────────
+    - name: "Copy | Sync config directories from backup into site"
+      ansible.builtin.shell: |
+        rsync -av --exclude="{{ ldap_config_file | basename }}" \
+          {{ staging_dir }}/{{ source_site }}/{{ item }}/ \
+          /opt/omd/sites/{{ dest_site }}/{{ item }}/
+      loop: "{{ config_dirs }}"
+      changed_when: true
+      tags: [copy]
+
+    - name: "Copy | Copy individual config files from backup into site"
+      ansible.builtin.copy:
+        src:        "{{ staging_dir }}/{{ source_site }}/{{ item }}"
+        dest:       "/opt/omd/sites/{{ dest_site }}/{{ item }}"
+        remote_src: true
+        owner:      "{{ dest_site }}"
+        group:      "{{ dest_site }}"
+        mode:       "0640"
+      loop: "{{ config_files }}"
+      failed_when: false   # non-fatal if a file doesn't exist in backup
+      tags: [copy]
+
+    # ── 4. Restore LDAP config (safety net) ───────────────────────────────────
+    - name: "LDAP | Restore LDAP config from backup copy"
+      ansible.builtin.copy:
+        src:        "/tmp/ldap_connections.mk.bak"
+        dest:       "/opt/omd/sites/{{ dest_site }}/{{ ldap_config_file }}"
+        remote_src: true
+        owner:      "{{ dest_site }}"
+        group:      "{{ dest_site }}"
+        mode:       "0640"
+      when: ldap_stat.stat.exists
+      tags: [copy, ldap]
+
+    # ── 5. Fix ownership on all copied files ──────────────────────────────────
+    - name: "Permissions | Fix ownership on site config"
+      ansible.builtin.file:
+        path:    "/opt/omd/sites/{{ dest_site }}/etc/check_mk"
+        owner:   "{{ dest_site }}"
+        group:   "{{ dest_site }}"
+        recurse: true
+      tags: [copy]
+
+    - name: "Permissions | Fix ownership on autochecks"
+      ansible.builtin.file:
+        path:    "/opt/omd/sites/{{ dest_site }}/var/check_mk/autochecks"
+        owner:   "{{ dest_site }}"
+        group:   "{{ dest_site }}"
+        recurse: true
+      tags: [copy]
+
+    # ── 6. Hostname prefix replacement ────────────────────────────────────────
+    - name: "Replace | Substitute '{{ old_prefix }}' → '{{ new_prefix }}' in config"
+      ansible.builtin.shell: |
+        find /opt/omd/sites/{{ dest_site }}/{{ item }} \
+          -type f \( -name "*.mk" -o -name "*.py" \) \
+          -exec sed -i 's/{{ old_prefix }}/{{ new_prefix }}/gI' {} \;
+      loop: "{{ replace_paths }}"
+      changed_when: true
+      tags: [replace]
+
+    # ── 7. Scan for stale references ──────────────────────────────────────────
+    - name: "Verify | Scan for remaining '{{ old_prefix }}' references"
+      ansible.builtin.shell: |
+        grep -r "{{ old_prefix }}" \
+          /opt/omd/sites/{{ dest_site }}/etc/check_mk/ \
+          /opt/omd/sites/{{ dest_site }}/var/check_mk/autochecks/ \
+          --include="*.mk" --include="*.py" -l 2>/dev/null || true
+      register: stale_refs
+      changed_when: false
+      tags: [verify]
+
+    - name: "Verify | Report stale references"
+      ansible.builtin.debug:
+        msg: >
+          {% if stale_refs.stdout | length > 0 %}
+          WARNING: '{{ old_prefix }}' still found in:
+          {{ stale_refs.stdout_lines }}
+          Review these files manually before activating.
+          {% else %}
+          OK: No stale '{{ old_prefix }}' references found.
+          {% endif %}
+      tags: [verify]
+
+    # ── 8. Start site and activate config ────────────────────────────────────
+    - name: "Activate | Start site"
+      ansible.builtin.command: "omd start {{ dest_site }}"
+      changed_when: true
+      tags: [activate]
+
+    - name: "Activate | Compile configuration (cmk -U)"
+      ansible.builtin.command: "su - {{ dest_site }} -c 'cmk -U'"
+      register: cmk_update
+      changed_when: true
+      failed_when: cmk_update.rc != 0
+      tags: [activate]
+
+    - name: "Activate | Activate configuration (cmk -O)"
+      ansible.builtin.command: "su - {{ dest_site }} -c 'cmk -O'"
+      register: cmk_activate
+      changed_when: true
+      failed_when: cmk_activate.rc != 0
+      tags: [activate]
+
+    - name: "Activate | Show activation output"
+      ansible.builtin.debug:
+        var: cmk_activate.stdout_lines
+      tags: [activate]
+
+    # ── 9. Validate against cmcdump ───────────────────────────────────────────
+    # Parse the cmcdump to extract the original RAF01A host list, then compare
+    # against what CheckMK now knows about. Any missing hosts are reported.
+
+    - name: "Validate | Extract host list from cmcdump"
+      ansible.builtin.shell: |
+        grep -oP "(?<=host_name\t)[^\t]+" {{ cmcdump_path }} \
+          | sort -u
+      register: cmcdump_hosts
+      changed_when: false
+      tags: [validate]
+
+    - name: "Validate | Get current host list from CheckMK"
+      ansible.builtin.shell: |
+        su - {{ dest_site }} -c "cmk --list-hosts" | sort -u
+      register: cmk_hosts
+      changed_when: false
+      tags: [validate]
+
+    - name: "Validate | Find hosts in cmcdump but missing from CheckMK"
+      ansible.builtin.shell: |
+        comm -23 \
+          <(echo "{{ cmcdump_hosts.stdout }}" | tr ' ' '\n' | sort) \
+          <(echo "{{ cmk_hosts.stdout }}" | tr ' ' '\n' | sort)
+      register: missing_hosts
+      changed_when: false
+      tags: [validate]
+
+    - name: "Validate | Report missing hosts"
+      ansible.builtin.debug:
+        msg: >
+          {% if missing_hosts.stdout | length > 0 %}
+          WARNING: The following hosts were in the original RAF01A cmcdump
+          but are NOT present in the rebuilt site — review manually:
+          {{ missing_hosts.stdout_lines }}
+          {% else %}
+          OK: All hosts from the original RAF01A cmcdump are present in
+          the rebuilt site.
+          {% endif %}
+      tags: [validate]
+
+    - name: "Validate | Summary counts"
+      ansible.builtin.debug:
+        msg:
+          - "Hosts in original cmcdump : {{ cmcdump_hosts.stdout_lines | length }}"
+          - "Hosts in rebuilt site     : {{ cmk_hosts.stdout_lines | length }}"
+          - "Missing from rebuilt site : {{ missing_hosts.stdout_lines | length }}"
+      tags: [validate]
+
+    # ── 10. Cleanup ───────────────────────────────────────────────────────────
+    - name: "Cleanup | Remove staging directory"
+      ansible.builtin.file:
+        path:  "{{ staging_dir }}"
+        state: absent
+      tags: [cleanup]
+
+    - name: "Cleanup | Remove backup archive from dest host"
+      ansible.builtin.file:
+        path:  "{{ backup_dest }}"
+        state: absent
+      tags: [cleanup]
+
+  ###############################################################################
+  # POST-TASKS
+  ###############################################################################
+  post_tasks:
+
+    - name: "Summary | Manual steps required after rebuild"
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - " CheckMK Rebuild Complete — Manual Steps Required"
+          - "============================================================"
+          - ""
+          - "  Site : {{ dest_site }} on {{ dest_host }}"
+          - ""
+          - "  1. PASSWORDS     — Reset all user passwords via WATO → Users."
+          - "                     Automation user API tokens have changed."
+          - ""
+          - "  2. LDAP          — Verify LDAP login works end-to-end."
+          - "                     Test with a known AD account."
+          - ""
+          - "  3. AGENTS        — Re-register agents against {{ new_prefix }}."
+          - "                     cmk-agent-ctl register on each monitored host."
+          - ""
+          - "  4. NOTIFICATIONS — Verify email relay and notification rules."
+          - ""
+          - "  5. SPECIAL AGENTS — Re-enter SNMP communities, API keys, and"
+          - "                     any other embedded credentials in WATO."
+          - ""
+          - "  6. DASHBOARDS    — Review dashboard titles for any cosmetic"
+          - "                     '{{ old_prefix }}' references."
+          - ""
+          - "  7. MISSING HOSTS — Review the validation output above and"
+          - "                     manually add any hosts not migrated."
+          - ""
+          - "  8. CERTIFICATES  — Verify TLS certs reflect the correct hostname."
+          - "============================================================"
+      tags: [always]
